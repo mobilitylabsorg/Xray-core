@@ -23,7 +23,7 @@ require (
 	github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/crypto v0.57.0
-	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842
+	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc
 	golang.org/x/net v0.59.0
 	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.48.0
@@ -56,8 +56,12 @@ require (
 	github.com/wlynxg/anet v0.0.5 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/text v0.42.0 // indirect
-	golang.org/x/time v0.14.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.49.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
+
+// UniRay: gVisor with pluggable congestion control, BBRv3 and RACK/SACK fixes
+// (apoxy-dev/ccsim), the same fork uniray-engine builds on. Branch uniray.
+replace gvisor.dev/gvisor => github.com/mobilitylabsorg/gvisor v0.0.0-20261009073017-f8bf70ec5e36

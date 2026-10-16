@@ -32,11 +32,9 @@ const (
 
 	tcpRXBufMinSize = tcp.MinBufferSize
 	tcpRXBufDefSize = tcp.DefaultSendBufferSize
-	tcpRXBufMaxSize = 8 << 20 // 8MiB
 
 	tcpTXBufMinSize = tcp.MinBufferSize
 	tcpTXBufDefSize = tcp.DefaultReceiveBufferSize
-	tcpTXBufMaxSize = 6 << 20 // 6MiB
 )
 
 // stackGVisor is ip stack implemented by gVisor package

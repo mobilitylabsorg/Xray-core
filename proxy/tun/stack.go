@@ -66,6 +66,10 @@ type stack struct {
 	verify bool
 	// stamps is set if connections carry the times of RFC 7323 when the other side does
 	stamps bool
+	// classic is set for tests of the recovery of RFC 5681 and RFC 6675 alone: a loss halves cwnd whatever the way
+	// was seen to take (see tcpConn.floor), and what was sent again is sent once more only when an acknowledgment
+	// says that it is lost as well (see tcpConn.quickTick)
+	classic bool
 	// handle is given every new connection that the other side opens. Without it those are refused
 	handle func(conn net.Conn, destination net.Destination)
 	udp    *udpConnectionHandler

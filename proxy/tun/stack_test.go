@@ -569,7 +569,8 @@ func TestTCPLargeSegment(t *testing.T) {
 func TestTCPRetransmit(t *testing.T) {
 	conns := make(chan accepted, 1)
 	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
-	newTestStack(t, l, accept(conns))
+	// the recovery of RFC 5681 and RFC 6675 alone: what was sent again is sent once more for what the system says
+	newTestStack(t, l, accept(conns)).classic = true
 	p.connect([]byte{2, 4, 0, 100, 4, 2, 0, 0})
 	a := take(t, conns)
 
@@ -667,7 +668,8 @@ func TestTCPLossAgain(t *testing.T) {
 	start := func(src string, sack bool) (*peer, *tcpConn) {
 		t.Helper()
 		p, l := newPeer(t, src, "10.0.0.2:80")
-		newTestStack(t, l, accept(conns))
+		// the recovery of RFC 5681 and RFC 6675 alone
+		newTestStack(t, l, accept(conns)).classic = true
 		options := []byte{2, 4, 0, 100}
 		if sack {
 			options = append(options, 4, 2, 0, 0)
@@ -824,6 +826,92 @@ func TestTCPLossAgain(t *testing.T) {
 	if _, _, _, retransmits := state(); retransmits != 0 {
 		t.Fatal("sent again by the timer")
 	}
+}
+
+// TestTCPLossFloor: a loss does not take cwnd below twice what the way was seen to take, and a segment that comes
+// late is not taken for lost before the system has enough past it
+func TestTCPLossFloor(t *testing.T) {
+	conns := make(chan accepted, 1)
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+	newTestStack(t, l, accept(conns))
+	p.connect([]byte{2, 4, 0, 100, 4, 2, 0, 0})
+	a := take(t, conns)
+	go a.conn.(buf.Writer).WriteMultiBuffer(buf.MergeBytes(nil, make([]byte, 8000)))
+	for range tcpStart {
+		p.receive()
+	}
+	p.ack += 100 * tcpStart
+	p.send(p.seq, tcpAck, nil, nil)
+	for range 2 * tcpStart {
+		p.receive()
+	}
+	c := a.conn.(*tcpConn)
+	has := func(from, to uint32) []byte {
+		return binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32([]byte{1, 1, 5, 10}, p.ack+from), p.ack+to)
+	}
+	// the way delivered 100 KB/s at a round trip of 10 ms: it holds 1000 bytes, the floor is twice that and 4 segments
+	c.mu.Lock()
+	c.bw = [tcpBwRounds]float64{100_000}
+	c.minRTT, c.minRTTAt = 10*time.Millisecond, time.Now()
+	floor := c.floor()
+	c.mu.Unlock()
+	if floor != 2400 {
+		t.Fatal("floor ", floor)
+	}
+	// two segments past the one waited for: it may only be late
+	p.send(p.seq, tcpAck, has(100, 300), nil)
+	p.silent(tcpTick / 4)
+	c.mu.Lock()
+	recovering := c.recovering
+	c.mu.Unlock()
+	if recovering {
+		t.Fatal("lost after two segments past it")
+	}
+	// the third: it is lost, and the way takes the floor rather than half of the 2000 bytes on their way
+	p.send(p.seq, tcpAck, has(100, 400), nil)
+	if s := p.receive(); s.seq != p.ack {
+		t.Fatal("not sent again: seq ", s.seq-p.ack)
+	}
+	c.mu.Lock()
+	cwnd, ssthresh := c.cwnd, c.ssthresh
+	c.mu.Unlock()
+	if cwnd != floor || ssthresh != floor {
+		t.Fatal("after the loss the way takes ", cwnd, " and then ", ssthresh)
+	}
+}
+
+// TestTCPLossQuick: in a loss, the segment that was sent again is sent once more when its answer is overdue, even
+// if the system says nothing more, as after the last of what was sent; once, and not after the timer ran out
+func TestTCPLossQuick(t *testing.T) {
+	conns := make(chan accepted, 1)
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+	newTestStack(t, l, accept(conns))
+	p.connect([]byte{2, 4, 0, 100, 4, 2, 0, 0})
+	a := take(t, conns)
+	go a.conn.(buf.Writer).WriteMultiBuffer(buf.MergeBytes(nil, make([]byte, 1000)))
+	for range tcpStart {
+		p.receive()
+	}
+	c := a.conn.(*tcpConn)
+	c.mu.Lock()
+	c.srtt, c.rttvar = time.Millisecond, 0
+	wait := c.quickWait()
+	c.mu.Unlock()
+	// all but the first came: it is sent again at once
+	p.send(p.seq, tcpAck, binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32([]byte{1, 1, 5, 10}, p.ack+100), p.ack+1000), nil)
+	start := time.Now()
+	if s := p.receive(); s.seq != p.ack {
+		t.Fatal("not sent again: seq ", s.seq-p.ack)
+	}
+	// nothing more is said: once more when its answer is overdue, not before
+	if s := p.receive(); s.seq != p.ack {
+		t.Fatal("not sent once more: seq ", s.seq-p.ack)
+	}
+	if d := time.Since(start); d < wait || d > wait+tcpTick/2 {
+		t.Fatal("sent once more after ", d, ", the answer was waited for ", wait)
+	}
+	// and only once: then the timer
+	p.silent(tcpTick)
 }
 
 // while the way to the system is away an open connection sends again every two seconds at most, so that it goes on

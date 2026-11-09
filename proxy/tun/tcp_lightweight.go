@@ -72,6 +72,14 @@ const (
 	tcpProbeTicks = 10
 	// tcpLinger is how long a closed connection waits for the system to close its side
 	tcpLinger = 30 * time.Second
+
+	// tcpDupThresh is how many segments the system has to have past one that it waits for before that one is
+	// taken for lost (RFC 6675): a segment that only comes late, as on a link that reorders, is not sent again
+	tcpDupThresh = 3
+	// tcpBwRounds is how many round trips the fastest delivery is remembered over, tcpMinRTTKeep how long the
+	// shortest round trip is (BBR's filters)
+	tcpBwRounds   = 10
+	tcpMinRTTKeep = 10 * time.Second
 )
 
 var (
@@ -203,9 +211,25 @@ type tcpConn struct {
 	timedAt time.Time
 	// srtt is how long an acknowledgment takes, rttvar how much that varies (RFC 6298)
 	srtt, rttvar time.Duration
+	// delivered is all that was acknowledged. A round trip starts at roundAt, with roundDelivered delivered, and ends
+	// when sndUna passes roundEnd: what was delivered over it is a sample of how fast the way delivers. bw keeps the
+	// samples of the last tcpBwRounds round trips, minRTT is the shortest round trip of the last tcpMinRTTKeep.
+	// A loss does not take cwnd below twice what the way holds by them (see floor): a link that loses a segment now
+	// and then, as a wireless one does, is not taken for one that is full (as BBR does)
+	delivered, roundDelivered uint64
+	roundEnd                  uint32
+	roundAt                   time.Time
+	bw                        [tcpBwRounds]float64
+	bwNext                    int
+	minRTT                    time.Duration
+	minRTTAt                  time.Time
 
 	timer *time.Timer
 	armed bool
+	// quick runs at quickAt, sooner than a tick, when the answer to the segment that was sent again in a loss is due
+	quick      *time.Timer
+	quickArmed bool
+	quickAt    time.Time
 	// stalled counts ticks without an acknowledgment of what waits for one
 	stalled, retransmitTicks, retransmits int
 	// lostTicks counts the ticks since the timer sent again the first time since something was acknowledged
@@ -542,6 +566,8 @@ func (c *tcpConn) acknowledge(s segment) {
 		c.sndUna = s.ack
 		c.dupAcks, c.stalled, c.retransmits = 0, 0, 0
 		c.release()
+		c.delivered += uint64(acked)
+		c.sampleRound()
 		n := 0
 		for n < len(c.sacked) && int32(c.sacked[n][0]-c.sndUna) <= 0 {
 			n++
@@ -563,6 +589,7 @@ func (c *tcpConn) acknowledge(s segment) {
 				c.lost = end
 			}
 			c.headAt = time.Now()
+			c.quickArm(c.quickWait())
 		}
 		// the way takes more if what it was given has arrived, as long as it was given about as much as it takes
 		if sent >= c.cwnd/2 {
@@ -593,14 +620,14 @@ func (c *tcpConn) acknowledge(s segment) {
 			}
 		}
 	}
-	if !c.recovering && c.sndUna != c.sndNxt && (len(c.sacked) > 0 || !c.sack && c.dupAcks >= 3) {
-		// the system has something past sndUna, or says the same for the third time when it cannot say what it has:
+	if !c.recovering && c.sndUna != c.sndNxt && (c.lostHead() || !c.sack && c.dupAcks >= tcpDupThresh) {
+		// the system has enough past sndUna, or says the same for the third time when it cannot say what it has:
 		// the segment at sndUna is lost. One that can say it repeats itself also for what it got twice
 		c.congested()
 		c.lost = c.sndUna + min(uint32(c.mss), c.sndNxt-c.sndUna)
 	}
 	if c.recovering {
-		if acked == 0 && c.srtt != 0 && !c.headAt.IsZero() && time.Since(c.headAt) > max(c.srtt+max(c.srtt/4, 4*c.rttvar), tcpTick/4) {
+		if acked == 0 && c.srtt != 0 && !c.headAt.IsZero() && time.Since(c.headAt) > c.headWait() {
 			// the segment that the system waits for was sent again longer ago than an answer takes, and the system
 			// still answers what comes after it: that one was lost as well. It is sent once more, and only once:
 			// the timer would find it too, but late, and then nothing is known anymore of how much the way takes
@@ -631,6 +658,9 @@ func (c *tcpConn) acknowledge(s segment) {
 func (c *tcpConn) clocked() {
 	d := time.Since(c.timedAt)
 	c.timedAt = time.Time{}
+	if c.minRTT == 0 || d <= c.minRTT || time.Since(c.minRTTAt) > tcpMinRTTKeep {
+		c.minRTT, c.minRTTAt = d, time.Now()
+	}
 	if c.srtt == 0 {
 		c.srtt, c.rttvar = d, d/2
 	} else {
@@ -669,10 +699,49 @@ func (c *tcpConn) sackAdd(start, end uint32) {
 // congested is called when something is lost: the way to the system takes half of what it was given,
 // and what is lost is sent again from sndUna. c.mu is held
 func (c *tcpConn) congested() {
-	c.ssthresh = max(min(c.cwnd, c.sndNxt-c.sndUna)/2, 2*uint32(c.mss))
+	c.ssthresh = max(min(c.cwnd, c.sndNxt-c.sndUna)/2, 2*uint32(c.mss), c.floor())
 	c.cwnd = c.ssthresh
 	c.recovering, c.recover, c.resent = true, c.sndNxt, c.sndUna
 	c.timedAt, c.headAt = time.Time{}, time.Time{}
+}
+
+// lostHead says that the segment at sndUna is lost: the system has tcpDupThresh segments past it, or the last
+// that was sent, after which nothing comes to say more. c.mu is held
+func (c *tcpConn) lostHead() bool {
+	if len(c.sacked) == 0 {
+		return false
+	}
+	var n uint32
+	for _, b := range c.sacked {
+		n += b[1] - b[0]
+	}
+	return n >= tcpDupThresh*uint32(c.mss) || c.sacked[len(c.sacked)-1][1] == c.sndNxt
+}
+
+// sampleRound ends the round trip when sndUna has passed its end, taking what it delivered as a sample of how
+// fast the way delivers, and starts the next one. c.mu is held
+func (c *tcpConn) sampleRound() {
+	now := time.Now()
+	if !c.roundAt.IsZero() {
+		if int32(c.sndUna-c.roundEnd) < 0 {
+			return
+		}
+		if d := now.Sub(c.roundAt); d > 0 {
+			c.bw[c.bwNext] = float64(c.delivered-c.roundDelivered) / d.Seconds()
+			c.bwNext = (c.bwNext + 1) % tcpBwRounds
+		}
+	}
+	c.roundEnd, c.roundDelivered, c.roundAt = c.sndNxt, c.delivered, now
+}
+
+// floor is the least that a loss leaves of cwnd: twice what the way holds, by the fastest delivery of the last
+// round trips and the shortest round trip, and the window at most. It is zero before both are known. c.mu is held
+func (c *tcpConn) floor() uint32 {
+	bw := slices.Max(c.bw[:])
+	if bw == 0 || c.minRTT == 0 || c.stack.classic {
+		return 0
+	}
+	return uint32(min(2*bw*c.minRTT.Seconds()+4*float64(c.mss), float64(c.window)))
 }
 
 // hole returns the first part at or after seq of what is lost: what the system does not have
@@ -737,6 +806,7 @@ func (c *tcpConn) resend() {
 		if start == c.sndUna {
 			// its answer is waited for from now on
 			c.headAt, c.stalled = time.Now(), 0
+			c.quickArm(c.quickWait())
 		}
 		c.retransmit(start, end)
 		c.resent = end
@@ -968,6 +1038,58 @@ func (c *tcpConn) arm(d time.Duration) {
 	}
 }
 
+// headWait is how long the answer to the segment that was sent again at sndUna is waited for before that one is
+// taken for lost as well: as long as an answer takes and a quarter more, and a quarter of a tick at least, as the
+// stack may get to what the system said only after a while. c.mu is held
+func (c *tcpConn) headWait() time.Duration {
+	return max(c.srtt+max(c.srtt/4, 4*c.rttvar), tcpTick/4)
+}
+
+// quickWait is how long quickTick waits for that answer: as long as headWait, but a millisecond or two at least
+// rather than a quarter of a tick, as on a way that answers in less than a millisecond, the time that the window
+// cannot be sent in for want of it is most of the time that the connection has. Sending it once more too soon is
+// one segment twice. c.mu is held
+func (c *tcpConn) quickWait() time.Duration {
+	return max(c.srtt+max(c.srtt/4, 4*c.rttvar), tcpTick/50)
+}
+
+// quickArm makes quickTick run after d, or sooner if it is going to already. c.mu is held
+func (c *tcpConn) quickArm(d time.Duration) {
+	at := time.Now().Add(d)
+	if c.quickArmed && !at.Before(c.quickAt) {
+		return
+	}
+	c.quickArmed, c.quickAt = true, at
+	if c.quick == nil {
+		c.quick = time.AfterFunc(d, c.quickTick)
+	} else {
+		c.quick.Reset(d)
+	}
+}
+
+// quickTick sends once more, in a loss, the segment that the system waits for when its answer is overdue. An
+// acknowledgment that comes sees that as well, but when the system has nothing more to say, as after the last of
+// what was sent, none comes, and the timer, which is ticks of 100 ms and waits several of them, is long on a way
+// whose answers take a millisecond
+func (c *tcpConn) quickTick() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.quickArmed = false
+	// not after the timer has run out: then the way may be away, and is tried less often every time
+	if c.err != nil || !c.established || c.sndUna == c.sndNxt || c.srtt == 0 || c.retransmits != 0 || c.stack.classic {
+		return
+	}
+	now := time.Now()
+	if c.recovering && !c.headAt.IsZero() {
+		if wait := c.quickWait() - now.Sub(c.headAt); wait > 0 {
+			c.quickArm(wait)
+		} else if start, end := c.hole(c.sndUna); start == c.sndUna && start != end {
+			c.retransmit(start, start+min(end-start, uint32(c.mss)))
+			c.headAt, c.stalled = time.Time{}, 0
+		}
+	}
+}
+
 // tick does what was put off and what has to be done again
 func (c *tcpConn) tick() {
 	c.mu.Lock()
@@ -982,6 +1104,12 @@ func (c *tcpConn) tick() {
 	switch {
 	case c.sndUna != c.sndNxt:
 		c.stalled++
+		if !c.recovering && len(c.sacked) > 0 {
+			// the system has something past sndUna and has said no more for a tick: the segment is lost
+			c.congested()
+			c.lost = c.sndUna + min(uint32(c.mss), c.sndNxt-c.sndUna)
+			c.resend()
+		}
 		due := c.stalled >= c.retransmitTicks
 		if c.established && c.retransmits > 0 {
 			due = due || c.stalled >= max(tcpRetransmitTicksOpen, c.answerTicks())<<(c.lostTicks/tcpMinuteTicks)
@@ -1045,6 +1173,9 @@ func (c *tcpConn) abort(err error) {
 	c.err = err
 	if c.timer != nil {
 		c.timer.Stop()
+	}
+	if c.quick != nil {
+		c.quick.Stop()
 	}
 	if c.opened != nil {
 		close(c.opened)

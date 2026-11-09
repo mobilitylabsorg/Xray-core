@@ -80,6 +80,10 @@ const (
 	// shortest round trip is (BBR's filters)
 	tcpBwRounds   = 10
 	tcpMinRTTKeep = 10 * time.Second
+	// tcpQueued is how much longer than the shortest round trip an answer takes, at least, when a queue on the way
+	// fills, and tcpLossy the part of what a round trip delivered that was sent again when it was too much for the way
+	tcpQueued = 5 * time.Millisecond
+	tcpLossy  = 10
 )
 
 var (
@@ -221,8 +225,12 @@ type tcpConn struct {
 	roundAt                   time.Time
 	bw                        [tcpBwRounds]float64
 	bwNext                    int
-	minRTT                    time.Duration
-	minRTTAt                  time.Time
+	// resentRound is what was sent again in the round trip, lossy is set if that was more than a tcpLossy-th of
+	// what the last one delivered
+	resentRound uint64
+	lossy       bool
+	minRTT      time.Duration
+	minRTTAt    time.Time
 
 	timer *time.Timer
 	armed bool
@@ -730,15 +738,25 @@ func (c *tcpConn) sampleRound() {
 			c.bw[c.bwNext] = float64(c.delivered-c.roundDelivered) / d.Seconds()
 			c.bwNext = (c.bwNext + 1) % tcpBwRounds
 		}
+		c.lossy = c.resentRound*tcpLossy > c.delivered-c.roundDelivered
 	}
-	c.roundEnd, c.roundDelivered, c.roundAt = c.sndNxt, c.delivered, now
+	c.roundEnd, c.roundDelivered, c.roundAt, c.resentRound = c.sndNxt, c.delivered, now, 0
+}
+
+// congestion says that a loss may be one of congestion, whose recovery is RFC 5681's alone: before the shortest
+// round trip is known; while answers take longer than that by as much as a queue that fills on the way makes them;
+// or while much of what is sent is lost, as when several connections share a way whose queue makes them lose.
+// A link that only loses a segment now and then, as a wireless one, keeps its answers as quick. c.mu is held
+func (c *tcpConn) congestion() bool {
+	return c.stack.classic || c.minRTT == 0 || c.lossy || c.srtt-c.minRTT > max(c.minRTT/2, tcpQueued)
 }
 
 // floor is the least that a loss leaves of cwnd: twice what the way holds, by the fastest delivery of the last
-// round trips and the shortest round trip, and the window at most. It is zero before both are known. c.mu is held
+// round trips and the shortest round trip, and the window at most: none when the loss may be one of congestion,
+// or before the delivery is known. c.mu is held
 func (c *tcpConn) floor() uint32 {
 	bw := slices.Max(c.bw[:])
-	if bw == 0 || c.minRTT == 0 || c.stack.classic {
+	if bw == 0 || c.congestion() {
 		return 0
 	}
 	return uint32(min(2*bw*c.minRTT.Seconds()+4*float64(c.mss), float64(c.window)))
@@ -951,6 +969,9 @@ func (c *tcpConn) hold(seq uint32, payload []byte) {
 
 // retransmit sends again what was sent from seq to end. c.mu is held
 func (c *tcpConn) retransmit(seq, end uint32) {
+	if int32(end-seq) > 0 {
+		c.resentRound += uint64(end - seq)
+	}
 	fin := false
 	if int32(end-c.sndNxt) >= 0 {
 		end, fin = c.sndNxt, c.sndFin
@@ -1075,8 +1096,9 @@ func (c *tcpConn) quickTick() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.quickArmed = false
-	// not after the timer has run out: then the way may be away, and is tried less often every time
-	if c.err != nil || !c.established || c.sndUna == c.sndNxt || c.srtt == 0 || c.retransmits != 0 || c.stack.classic {
+	// not after the timer has run out: then the way may be away, and is tried less often every time. Nor in
+	// congestion: then an answer that is late is one that waits in a queue, and what is sent again adds to it
+	if c.err != nil || !c.established || c.sndUna == c.sndNxt || c.srtt == 0 || c.retransmits != 0 || c.congestion() {
 		return
 	}
 	now := time.Now()

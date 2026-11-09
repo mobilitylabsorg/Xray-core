@@ -878,6 +878,17 @@ func TestTCPLossFloor(t *testing.T) {
 	if cwnd != floor || ssthresh != floor {
 		t.Fatal("after the loss the way takes ", cwnd, " and then ", ssthresh)
 	}
+	// answers that wait in a queue, or much sent again: the loss may be one of congestion, and there is no floor
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.srtt = c.minRTT + 2*tcpQueued
+	if f := c.floor(); f != 0 {
+		t.Fatal("floor ", f, " with answers that take twice as long")
+	}
+	c.srtt, c.lossy = c.minRTT, true
+	if f := c.floor(); f != 0 {
+		t.Fatal("floor ", f, " with much sent again")
+	}
 }
 
 // TestTCPLossQuick: in a loss, the segment that was sent again is sent once more when its answer is overdue, even
